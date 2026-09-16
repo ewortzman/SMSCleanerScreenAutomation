@@ -53,6 +53,20 @@ object CleanerConfig {
         get() = prefs.getBoolean("dumpRequested", false)
         set(value) = prefs.edit().putBoolean("dumpRequested", value).apply()
 
+    /** Messages from this date and earlier are eligible for deletion. Stored as LocalDate.toEpochDay(). */
+    var targetDateEpochDay: Long
+        get() = prefs.getLong("targetDateEpochDay", java.time.LocalDate.now().minusMonths(3).toEpochDay())
+        set(value) = prefs.edit().putLong("targetDateEpochDay", value).apply()
+
+    /**
+     * True once the seek phase has scrolled back far enough to reach [targetDateEpochDay].
+     * Persisted so stopping/restarting the service doesn't re-run the (slow) seek phase
+     * unnecessarily. Reset to false by MainActivity whenever the target date changes.
+     */
+    var seekComplete: Boolean
+        get() = prefs.getBoolean("seekComplete", false)
+        set(value) = prefs.edit().putBoolean("seekComplete", value).apply()
+
     fun resetSessionCounters() {
         totalDeletedThisSession = 0
     }

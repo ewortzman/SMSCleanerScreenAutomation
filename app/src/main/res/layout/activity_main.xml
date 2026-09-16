@@ -66,8 +66,33 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:paddingTop="24dp"
+            android:text="Delete messages on or before this date (keep everything newer):" />
+        <TextView
+            android:id="@+id/targetDateText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
             android:textStyle="bold"
-            android:text="Before starting: open Google Messages, open the long thread, manually scroll to just past the point where you want deletion to stop (the newest message you want DELETED should be near the top of the visible screen). The service works upward from wherever the thread is scrolled to when you hit Start." />
+            android:textSize="16sp"
+            android:text="(not set)" />
+        <Button
+            android:id="@+id/pickDateButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="Pick target date" />
+        <Button
+            android:id="@+id/resetSeekButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="Reset seek progress (force re-scroll to target date)" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:paddingTop="24dp"
+            android:textStyle="bold"
+            android:text="Before starting: open Google Messages and open the long thread (any scroll position -- the seek phase below scrolls to the target date automatically). Leave the thread open and foregrounded while this runs." />
 
         <Button
             android:id="@+id/dumpTreeButton"

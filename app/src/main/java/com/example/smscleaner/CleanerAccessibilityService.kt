@@ -6,20 +6,26 @@ import android.os.Looper
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import java.time.LocalDate
 
 /**
  * Polls the foreground window ~every second and drives a simple, stateless-per-tick
- * loop: enter selection mode -> select visible unselected rows -> scroll up -> repeat
- * until CleanerConfig.batchSize is reached -> delete -> repeat.
+ * loop:
+ *   1. Seek phase (until CleanerConfig.seekComplete): scroll up reading date-divider
+ *      headers until one at or before the target date is visible -- no selecting or
+ *      deleting yet.
+ *   2. Clean phase: enter selection mode -> select visible unselected rows -> scroll up
+ *      -> repeat until CleanerConfig.batchSize is reached -> delete -> repeat.
  *
  * "Stateless-per-tick" means each tick re-reads the actual screen to decide what to do
  * next, rather than trusting an internal state machine. That makes it resilient to
  * being paused/resumed/interrupted (screen off, app switched away, etc.) -- worst case
  * it just re-evaluates and picks up wherever the UI actually is.
  *
- * IMPORTANT: the node-matching logic in Selectors.kt is an unverified best guess about
- * Google Messages' UI. Use "Dump current screen tree to Logcat" in the app + `adb logcat
- * -s SMSCleanerTree` to check it against your actual device and fix any mismatches.
+ * IMPORTANT: the node-matching logic in Selectors.kt/DateSeek.kt is an unverified best
+ * guess about Google Messages' UI. Use "Dump current screen tree to Logcat" in the app
+ * + `adb logcat -s SMSCleanerTree` to check it against your actual device and fix any
+ * mismatches.
  */
 class CleanerAccessibilityService : AccessibilityService() {
 
@@ -31,6 +37,10 @@ class CleanerAccessibilityService : AccessibilityService() {
         private const val SETTLE_DELAY_MS = 500L
         private const val SCROLL_SETTLE_DELAY_MS = 700L
         private const val DELETE_SETTLE_DELAY_MS = 1500L
+
+        // Seek phase safety valves -- see tickSeek().
+        private const val SEEK_NO_DATE_LIMIT = 300 // ~4-5 min of scrolling with no divider recognized at all
+        private const val SEEK_STALL_LIMIT = 5     // same oldest-visible-date seen this many ticks in a row
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -40,6 +50,11 @@ class CleanerAccessibilityService : AccessibilityService() {
     // wouldn't get auto-confirmed -- see README "Known limitations".
     private var pendingConfirmClick = false
     private var pendingDeleteCount = 0
+
+    // In-memory only: seek-phase progress tracking, reset whenever seeking (re)starts.
+    private var seekLastOldestDate: LocalDate? = null
+    private var seekStallStreak = 0
+    private var seekNoDateStreak = 0
 
     private val tickRunnable = object : Runnable {
         override fun run() {
@@ -91,6 +106,10 @@ class CleanerAccessibilityService : AccessibilityService() {
         if (recycler == null) {
             status("Can't find the message list container -- selectors need tuning (see Selectors.kt).")
             return TICK_DELAY_MS
+        }
+
+        if (!CleanerConfig.seekComplete) {
+            return tickSeek(recycler)
         }
 
         val selectedCount = readSelectionCount(root)
@@ -160,6 +179,92 @@ class CleanerAccessibilityService : AccessibilityService() {
                 }
             }
         }
+    }
+
+    /**
+     * Scrolls upward (further into the past) reading date-divider headers until one at
+     * or before the target date is visible, then flips CleanerConfig.seekComplete so
+     * subsequent ticks fall through to the normal select/delete loop. Never selects or
+     * deletes anything itself.
+     *
+     * Two safety valves, since date-divider recognition is unverified (see DateSeek.kt):
+     *   - SEEK_NO_DATE_LIMIT: give up if no divider is ever recognized on screen.
+     *   - SEEK_STALL_LIMIT: if the same oldest-visible date keeps showing up across
+     *     several ticks, scrolling isn't making progress (most likely the true top of
+     *     the thread) -- treat that as "reached the target" rather than looping forever.
+     */
+    private fun tickSeek(recycler: AccessibilityNodeInfo): Long {
+        val target = LocalDate.ofEpochDay(CleanerConfig.targetDateEpochDay)
+        val rows = findMessageRows(recycler)
+        val oldestVisible = findOldestVisibleDate(recycler, rows)
+
+        if (oldestVisible == null) {
+            seekNoDateStreak++
+            if (seekNoDateStreak >= SEEK_NO_DATE_LIMIT) {
+                status("Seek: never recognized a date-divider after $seekNoDateStreak tries -- stopping for safety. Tune DateSeek.kt.")
+                CleanerConfig.isRunning = false
+                resetSeekTracking()
+                return TICK_DELAY_MS
+            }
+            status("Seeking to $target... no date divider recognized on screen yet ($seekNoDateStreak/$SEEK_NO_DATE_LIMIT).")
+            scrollUp(recycler)
+            return SCROLL_SETTLE_DELAY_MS
+        }
+
+        seekNoDateStreak = 0
+
+        if (!oldestVisible.isAfter(target)) {
+            status("Seek reached target date $target (oldest visible divider: $oldestVisible). Switching to delete phase.")
+            CleanerConfig.seekComplete = true
+            resetSeekTracking()
+            return SETTLE_DELAY_MS
+        }
+
+        if (oldestVisible == seekLastOldestDate) {
+            seekStallStreak++
+        } else {
+            seekStallStreak = 0
+            seekLastOldestDate = oldestVisible
+        }
+
+        if (seekStallStreak >= SEEK_STALL_LIMIT) {
+            status("Seek: no scroll progress past $oldestVisible for $seekStallStreak ticks (likely reached top of thread) -- switching to delete phase.")
+            CleanerConfig.seekComplete = true
+            resetSeekTracking()
+            return SETTLE_DELAY_MS
+        }
+
+        status("Seeking to $target... oldest visible divider: $oldestVisible")
+        scrollUp(recycler)
+        return SCROLL_SETTLE_DELAY_MS
+    }
+
+    private fun resetSeekTracking() {
+        seekLastOldestDate = null
+        seekStallStreak = 0
+        seekNoDateStreak = 0
+    }
+
+    /**
+     * Looks for date-divider text among [recycler]'s descendants, excluding anything
+     * inside a message row (so message *content* that happens to look like a date, e.g.
+     * a text literally saying "Monday", isn't mistaken for a divider). Returns the
+     * oldest date found on screen, since that's how far back this screen actually
+     * reaches.
+     */
+    private fun findOldestVisibleDate(recycler: AccessibilityNodeInfo, rows: List<AccessibilityNodeInfo>): LocalDate? {
+        val excluded = HashSet<AccessibilityNodeInfo>()
+        for (row in rows) {
+            row.selfAndDescendants().forEach { excluded.add(it) }
+        }
+        var oldest: LocalDate? = null
+        for (node in recycler.selfAndDescendants()) {
+            if (node in excluded || node.isClickable) continue
+            val text = node.text?.toString() ?: continue
+            val parsed = DateSeek.parse(text) ?: continue
+            if (oldest == null || parsed.isBefore(oldest)) oldest = parsed
+        }
+        return oldest
     }
 
     private fun readSelectionCount(root: AccessibilityNodeInfo): Int? {
